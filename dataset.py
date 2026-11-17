@@ -1,147 +1,102 @@
-"""
-Synthetic dataset generator for U-Net training.
-Creates paired images and segmentation masks.
-"""
+"""Pair and preprocess real images and binary segmentation masks."""
 
-import numpy as np
-import cv2
-from tensorflow import keras
-import os
+from pathlib import Path
+
+import tensorflow as tf
 
 
-class SyntheticSegmentationDataset:
-    """Generate synthetic image-mask pairs for training."""
-    
-    def __init__(self, num_samples=100, image_size=(256, 256), num_classes=2):
-        """
-        Initialize dataset generator.
-        
-        Args:
-            num_samples: Number of training samples to generate
-            image_size: (height, width) of images
-            num_classes: Number of segmentation classes
-        """
-        self.num_samples = num_samples
-        self.image_size = image_size
-        self.num_classes = num_classes
-        
-    def _generate_synthetic_image(self):
-        """Generate a random synthetic image with shapes."""
-        image = np.ones((*self.image_size, 3), dtype=np.uint8) * 200
-        
-        # Add some random shapes and noise
-        num_circles = np.random.randint(2, 5)
-        for _ in range(num_circles):
-            x = np.random.randint(20, self.image_size[1] - 20)
-            y = np.random.randint(20, self.image_size[0] - 20)
-            radius = np.random.randint(10, 40)
-            color = tuple(np.random.randint(50, 200, 3).tolist())
-            cv2.circle(image, (x, y), radius, color, -1)
-        
-        # Add Gaussian noise
-        noise = np.random.normal(0, 15, image.shape).astype(np.int16)
-        image = np.clip(image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-        
-        return image
-    
-    def _generate_synthetic_mask(self):
-        """Generate a segmentation mask with two classes."""
-        mask = np.zeros(self.image_size, dtype=np.uint8)
-        
-        # Create some infected regions (class 1)
-        num_regions = np.random.randint(1, 4)
-        for _ in range(num_regions):
-            x = np.random.randint(30, self.image_size[1] - 30)
-            y = np.random.randint(30, self.image_size[0] - 30)
-            radius = np.random.randint(15, 50)
-            cv2.circle(mask, (x, y), radius, 1, -1)
-        
-        return mask
-    
-    def generate(self, save_dir='./data'):
-        """
-        Generate and save synthetic dataset.
-        
-        Returns:
-            Tuple of (images_array, masks_array)
-        """
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(f'{save_dir}/images', exist_ok=True)
-        os.makedirs(f'{save_dir}/masks', exist_ok=True)
-        
-        images = []
-        masks = []
-        
-        for i in range(self.num_samples):
-            image = self._generate_synthetic_image()
-            mask = self._generate_synthetic_mask()
-            
-            images.append(image)
-            masks.append(mask)
-            
-            # Save individual files
-            cv2.imwrite(f'{save_dir}/images/image_{i:04d}.png', image)
-            cv2.imwrite(f'{save_dir}/masks/mask_{i:04d}.png', mask * 255)
-            
-            if (i + 1) % 20 == 0:
-                print(f"Generated {i + 1}/{self.num_samples} samples")
-        
-        # Convert to numpy arrays and normalize
-        images = np.array(images, dtype=np.float32) / 255.0
-        masks = np.array(masks, dtype=np.float32)
-        
-        # Convert masks to one-hot encoding
-        masks_onehot = np.zeros((*masks.shape, self.num_classes), dtype=np.float32)
-        masks_onehot[..., 0] = 1.0 - masks
-        masks_onehot[..., 1] = masks
-        
-        print(f"\nDataset generation complete!")
-        print(f"Images shape: {images.shape}")
-        print(f"Masks shape (one-hot): {masks_onehot.shape}")
-        
-        return images, masks_onehot
+SUPPORTED_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png"}
 
 
-def load_dataset(data_dir='./data', num_classes=2):
-    """
-    Load generated dataset from disk.
-    
-    Args:
-        data_dir: Directory containing 'images' and 'masks' subdirectories
-        num_classes: Number of segmentation classes
-    
-    Returns:
-        Tuple of (images_array, masks_array)
-    """
-    images = []
-    masks = []
-    
-    image_dir = f'{data_dir}/images'
-    mask_dir = f'{data_dir}/masks'
-    
-    image_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
-    
-    for img_file in image_files:
-        img = cv2.imread(f'{image_dir}/{img_file}')
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        images.append(img.astype(np.float32) / 255.0)
-        
-        mask_file = img_file.replace('image_', 'mask_')
-        mask = cv2.imread(f'{mask_dir}/{mask_file}', cv2.IMREAD_GRAYSCALE)
-        masks.append(mask.astype(np.float32) / 255.0)
-    
-    images = np.array(images)
-    masks = np.array(masks)
-    
-    # Convert masks to one-hot encoding
-    masks_onehot = np.zeros((*masks.shape, num_classes), dtype=np.float32)
-    masks_onehot[..., 0] = 1.0 - masks
-    masks_onehot[..., 1] = masks
-    
-    return images, masks_onehot
+def _index_images(directory: Path) -> dict[str, Path]:
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Directory does not exist: {directory}")
+
+    indexed: dict[str, Path] = {}
+    for path in directory.iterdir():
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            key = path.stem.lower()
+            if key in indexed:
+                raise ValueError(f"Duplicate image filename stem in {directory}: {path.stem}")
+            indexed[key] = path
+    if not indexed:
+        raise ValueError(f"No supported images found in {directory}")
+    return indexed
 
 
-if __name__ == "__main__":
-    # Generate synthetic dataset
-    dataset_gen = SyntheticSegmentationDataset(num_samples=100, image_size=(256, 256), num_classes=2)
-    images, masks = dataset_gen.generate()
+def find_pairs(image_dir: Path, mask_dir: Path) -> list[tuple[Path, Path]]:
+    """Find one-to-one image/mask pairs whose filenames match by stem."""
+    images = _index_images(image_dir)
+    masks = _index_images(mask_dir)
+    missing_masks = sorted(images.keys() - masks.keys())
+    missing_images = sorted(masks.keys() - images.keys())
+    if missing_masks or missing_images:
+        raise ValueError(
+            "Image/mask filenames must match by stem. "
+            f"Masks missing for: {missing_masks}; images missing for: {missing_images}"
+        )
+    return [(images[key], masks[key]) for key in sorted(images)]
+
+
+def _load_pair(
+    image_path: tf.Tensor,
+    mask_path: tf.Tensor,
+    image_size: int,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    image = tf.io.decode_image(
+        tf.io.read_file(image_path), channels=3, expand_animations=False
+    )
+    mask = tf.io.decode_image(
+        tf.io.read_file(mask_path), channels=1, expand_animations=False
+    )
+    image.set_shape([None, None, 3])
+    mask.set_shape([None, None, 1])
+
+    image = tf.image.resize(image, [image_size, image_size], method="bilinear")
+    mask = tf.image.resize(mask, [image_size, image_size], method="nearest")
+    image = tf.cast(image, tf.float32) / 255.0
+
+    # Accept binary masks stored as either 0/1 or 0/255.
+    threshold = tf.where(tf.reduce_max(mask) <= 1, 0.0, 127.5)
+    mask = tf.cast(mask > threshold, tf.float32)
+    return image, mask
+
+
+def make_dataset(
+    pairs: list[tuple[Path, Path]],
+    image_size: int = 256,
+    batch_size: int = 8,
+    shuffle: bool = False,
+    seed: int = 42,
+) -> tf.data.Dataset:
+    """Build a batched dataset from image/mask pairs."""
+    if not pairs:
+        raise ValueError("Cannot build a dataset from zero image/mask pairs")
+    if image_size < 1:
+        raise ValueError("image_size must be positive")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+
+    image_paths = [str(image) for image, _ in pairs]
+    mask_paths = [str(mask) for _, mask in pairs]
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
+    if shuffle:
+        dataset = dataset.shuffle(len(pairs), seed=seed, reshuffle_each_iteration=True)
+    dataset = dataset.map(
+        lambda image, mask: _load_pair(image, mask, image_size),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def load_dataset(
+    image_dir: Path,
+    mask_dir: Path,
+    image_size: int = 256,
+    batch_size: int = 8,
+    shuffle: bool = False,
+    seed: int = 42,
+) -> tf.data.Dataset:
+    """Load real paired images and masks from separate directories."""
+    pairs = find_pairs(Path(image_dir), Path(mask_dir))
+    return make_dataset(pairs, image_size, batch_size, shuffle, seed)
